@@ -30,6 +30,7 @@ from transformers.utils import logging
 from transformers.modeling_utils import PreTrainedModel
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from .by_pass_attention import TextQformerCrossAttention, QueryImageCrossAttention, QuerySelfAttention, TextQueryCrossAttention
+from ..config import LlavaFGloraConfig, PerceiverConfig
 from ...model.multimodal_encoder.visual_tokenizer import VisualTokenizer
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import LlamaAttention
@@ -162,43 +163,9 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-class perceiver_config:
-    def __init__(self, num_queries: int = 64, hidden_size: int = 768, encoder_hidden_size: int = 1024, cross_attention_frequency: int = 2, num_hidden_layers: int = 12, num_attention_heads: int = 12, qk_normalization: bool = True):
-        self.num_queries = num_queries
-        self.hidden_size = hidden_size
-        self.encoder_hidden_size = encoder_hidden_size
-        self.cross_attention_frequency = cross_attention_frequency
-        self.num_hidden_layers = num_hidden_layers 
-        self.num_attention_heads = num_attention_heads
-        self.qk_normalization = qk_normalization
-        
-class LlavaFGloraConfig(LlamaConfig):
-    model_type = "llava_llama"
-    def __init__(self, 
-                 num_queries: int = 64, 
-                 by_pass_hidden_size: int = 1024, 
-                 save_mem: bool = True, 
-                 num_levels: int = 4, 
-                 num_points: int = 64, 
-                 spatial_shapes: List[Tuple] = [(12, 12), (24, 24), (48, 48), (96, 96)],
-                 im2col_step: int = 64, 
-                 if_query_self_attn: bool = False,
-                 visual_perceiver_config: perceiver_config = None,
-                 *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_queries = num_queries
-        self.by_pass_hidden_size = by_pass_hidden_size
-        self.save_mem = save_mem
-        self.num_levels = num_levels
-        self.num_points = num_points
-        self.spatial_shapes = spatial_shapes
-        self.im2col_step = im2col_step
-        self.if_query_self_attn = if_query_self_attn
-        self.visual_perceiver_config = visual_perceiver_config
-
 class LlavaFGloraAttention(LlamaAttention):
-    def __init__(self, config: LlavaFGloraConfig, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
+    def __init__(self, config: LlavaFGloraConfig):
+        super().__init__(config)
         self.config = config
         self.query_text_cross_attn = TextQformerCrossAttention(config)
         self.query_image_cross_attn = QueryImageCrossAttention(config)
@@ -209,7 +176,7 @@ class LlavaFGloraAttention(LlamaAttention):
         self,
         hidden_states: torch.Tensor,
         multi_scale_images_features: torch.Tensor,                      # torch.size([bsz, n_images, \sum_{l=1}^{l=L} h_l * w_l, image_embed_dim])
-        multi_scale_images_shape: torch.Tensor,                         # torch.size([n_images, n_levels])
+        multi_scale_images_shape: List[Tuple[int, int]],                         # e.g. [(12, 12), (24, 24), (48, 48), (96, 96)]
         image_positions: torch.Tensor,                                  # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
         attention_mask: Optional[torch.Tensor] = None,
         image_attention_mask: torch.Tensor = None,                      # 就像 hiddens_states里面有对应的attention_mask，知道哪些部分的token是padding得到的, multi_scale_images_features也有padding得到的部分, 对应的image_attnetion_mask  
@@ -240,9 +207,9 @@ class LlavaFGloraAttention(LlamaAttention):
             hidden_states = hidden_states,
             by_pass_hidden_states = by_pass_hidden_states,
             multi_scale_images_features = multi_scale_images_features,
-            multi_scale_images_shape = multi_scale_images_shape,
+            spatial_shapes = multi_scale_images_shape,
             image_positions = image_positions,
-            attention_mask = image_attention_mask,
+            image_attention_mask = image_attention_mask,
             position_ids = position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -298,7 +265,7 @@ class LlavaFGloraDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         multi_scale_images_features: torch.Tensor,                      # torch.size([bsz, n_images, \sum_{l=1}^{l=L} h_l * w_l, image_embed_dim])
-        multi_scale_images_shape: torch.Tensor,                         # torch.size([n_images, n_levels])
+        multi_scale_images_shape: List[Tuple[int, int]],                # e.g. [(12, 12), (24, 24), (48, 48), (96, 96)]
         image_positions: torch.Tensor,                                  # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
         attention_mask: Optional[torch.Tensor] = None,
         image_attention_mask: torch.Tensor = None, 
@@ -356,7 +323,7 @@ class LlavaFGloraDecoderLayer(nn.Module):
 
         return outputs
     
-class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
+class LlavaFGloraModel(LlamaModel, LlavaMetaModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -366,10 +333,11 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
 
     def __init__(self, config: LlavaFGloraConfig):
         super().__init__(config)
+        self.config= config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)       # 32000 4096 0
         self.layers = nn.ModuleList([LlavaFGloraDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -377,6 +345,14 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def initialize_extract_multi_feature_modules(self, model_args, fsdp=None):
+        self.visual_tokenizer = VisualTokenizer(vision_tower=self.vision_tower.vision_tower,        # self.vision_tower.vision_tower 对应的class CLIPVisionModel
+                                            perceiver_config=model_args.perceiver_config,
+                                            llm_hidden_size=model_args.hidden_size)
+        # self.visual_tokenizer = VisualTokenizer(encoder_model_path=model_args.image_feature_extractor,
+        #                                     pretrain_mm_mlp_adapter=model_args.pretrain_mm_mlp_adapter,
+        #                                     perceiver_config=model_args.perceiver_config,
+        #                                     llm_hidden_size=model_args.hidden_size)
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -410,7 +386,7 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
     def forward(
         self,
         multi_scale_images_features: torch.Tensor,                      # torch.size([bsz, n_images, \sum_{l=1}^{l=L} h_l * w_l, image_embed_dim])
-        multi_scale_images_shape: torch.Tensor,                         # torch.size([n_images, n_levels])
+        multi_scale_images_shape: List[Tuple[int, int]],                # e.g. [(12, 12), (24, 24), (48, 48), (96, 96)]
         image_positions: torch.Tensor,                                  # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -500,7 +476,11 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states,
+                    multi_scale_images_features,
+                    multi_scale_images_shape,
+                    image_positions,
                     attention_mask,
+                    image_attention_mask,
                     position_ids,
                     None,
                 )
@@ -508,7 +488,7 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
                 layer_outputs = decoder_layer(
                     hidden_states=hidden_states,
                     multi_scale_images_features=multi_scale_images_features,                        # torch.size([bsz, n_images, \sum_{l=1}^{l=L} h_l * w_l, image_embed_dim])
-                    multi_scale_images_shape=multi_scale_images_shape,                           # torch.size([n_images, n_levels])
+                    multi_scale_images_shape=multi_scale_images_shape,                           # e.g. [(12, 12), (24, 24), (48, 48), (96, 96)]
                     image_positions=image_positions,                                    # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
                     attention_mask=attention_mask,
                     image_attention_mask=image_attention_mask,
@@ -542,16 +522,13 @@ class LlavaFGloraModel(LlamaPreTrainedModel, LlavaMetaModel):
             attentions=all_self_attns,
         )
 
-class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
+class LlavaLlamaFGloraForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
+    config_class = LlavaFGloraConfig
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: LlavaFGloraConfig):
-        super().__init__(config)
+        super(LlamaForCausalLM, self).__init__(config)
         self.config = config
-        self.visual_tokenizer = VisualTokenizer(encoder_model_path=config.vision_tower,
-                                            pretrain_mm_mlp_adapter=config.pretrain_mm_mlp_adapter,
-                                            perceiver_config=config.visual_perceiver_config,
-                                            llm_hidden_size=config.hidden_size)
         self.model = LlavaFGloraModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -575,18 +552,17 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
 
     def get_decoder(self):
         return self.model
-
+    
+    def get_model(self):
+        return self.model
+    
     def prepare_inputs_images_features(
         self,
         input_ids: torch.LongTensor,
         image_tensors: Optional[torch.FloatTensor] = None,
         num_image_per_seq: Optional[torch.Tensor] = None,
     ):
-        output = {}
-
         # step 1. get text token embeds
-        input_embeds = self.model.get_input_embeddings()(input_ids)
-        B, L, C = input_embeds.shape
 
         assert num_image_per_seq.sum() == image_tensors.shape[0], (
             f"image_tensors.shape: {image_tensors.shape} | "
@@ -594,18 +570,17 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
         )
 
         # step 2. get image embeds
-        visual_output = self.visual_tokenizer(image_tensors)
-       
+        output = self.model.visual_tokenizer(image_tensors)
+
 
         # step 4. prepare cross attention mask and MMFS features for mm decoder
         output.update(
             self._prepare_mmfs_features_for_mm_decoder(
                 input_ids,
                 num_image_per_seq,
-                visual_output["multiscale_features"],
+                output["multiscale_features"],
             )
         )
-        output["multiscale_features"] = visual_output["multiscale_features"]
 
         return output
 
@@ -619,7 +594,7 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
 
         B, L = input_ids.shape
 
-        max_num_image = num_image_per_seq.max()
+        max_num_image = int(num_image_per_seq.max())
         
         # 通过设置 as_tuple=True 参数，.nonzero() 方法将返回一个元组，其中包含两个张量，分别表示非零元素的行索引和列索引
         # mask = torch.tensor([[0, 0, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1, 0]])
@@ -632,10 +607,10 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
         
         # tensor([3, 5, 1, 3, 5]) -> tensor([[3, 5, -1], [1, 3, 5]])
         for i in range(B):          # Start of Image i.e. soi
-            image_token_pos[i, : num_image_per_seq[i]] = (
-                soi_token_pos[start_idx : start_idx + num_image_per_seq[i]] + 1
+            image_token_pos[i, : int(num_image_per_seq[i])] = (
+                soi_token_pos[start_idx : start_idx + int(num_image_per_seq[i])] + 1
             )
-            start_idx = start_idx + num_image_per_seq[i]
+            start_idx = start_idx + int(num_image_per_seq[i])
 
 
 
@@ -643,9 +618,7 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
         mmfs_features = []                      
         for feat in multiscale_features:        #       torch.Size([8, 1024, 96, 96])  torch.Size([8, 1024, 48, 48])    
                                                 #       torch.Size([8, 1024, 24, 24])  torch.Size([8, 1024, 12, 12])
-            shape = int(feat.shape[-1])
-            if shape in self.spatial_shapes:
-                mmfs_features.append(feat)
+            mmfs_features.append(feat)
         mmfs_features_new = [
             torch.zeros(
                 B,  
@@ -659,9 +632,9 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
         for feat, feat_n in zip(mmfs_features, mmfs_features_new):
             start_idx = 0
             for i in range(B):
-                item = feat[start_idx : start_idx + num_image_per_seq[i]]
+                item = feat[start_idx : start_idx + int(num_image_per_seq[i])]
                 feat_n[i, : item.shape[0], ...] = item
-                start_idx = start_idx + num_image_per_seq[i]
+                start_idx = start_idx + int(num_image_per_seq[i])
 
         mmfs_features_mm = []
         for feat in mmfs_features_new:
@@ -675,7 +648,7 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
     
     def forward(
         self,
-        image_tensors: Optional[torch.FloatTensor] = None,
+        images: Optional[torch.FloatTensor] = None,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -729,17 +702,18 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 labels,
-                image_tensors,
+                images,
             )
             
+   
             output = self.prepare_inputs_images_features(
                 input_ids,
-                image_tensors,
-                num_image_per_seq,
+                image_tensors=images,
+                num_image_per_seq=num_image_per_seq,
             )
             
             multi_scale_images_features = output.pop("mmfs_features_mm", None)
-
+            multi_scale_images_shape = output.pop("spatial_shapes", None)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -747,17 +721,16 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        multi_scale_images_shape = torch.as_tensor(self.config.spatial_shapes)
+
         
-        image_attention_mask = torch.zeros(input_ids.shape[0], num_image_per_seq.max())
+        image_attention_mask = torch.zeros(input_ids.shape[0], int(num_image_per_seq.max()))
         for i, num_images in enumerate(num_image_per_seq):
-            image_attention_mask[i, :num_images] = 1
-            
+            image_attention_mask[i, :int(num_images)] = 1
         outputs = self.model(
             multi_scale_images_features=multi_scale_images_features,
             multi_scale_images_shape=multi_scale_images_shape,
-            image_position=image_positions,
-            input_ids=input_ids,
+            image_positions=image_positions,
+            input_ids=None,
             attention_mask=attention_mask,
             image_attention_mask=image_attention_mask,
             position_ids=position_ids,
@@ -872,5 +845,5 @@ class LlavaLlamaFGoraForCausalLM(LlamaPreTrainedModel, LlavaMetaForCausalLM):
 
 
     
-AutoConfig.register("llava_llama_FGlora", LlavaLlamaFGoraForCausalLM)           
-AutoModelForCausalLM.register(LlavaFGloraConfig, LlavaLlamaFGoraForCausalLM)       # 通过注册自动生成的模型，我们可以使用AutoModelForCausalLM.from_pretrained("llava_llama")来加载和使用与"llava_llama"配置相关联的模型
+AutoConfig.register("llava_llama_FGlora", LlavaLlamaFGloraForCausalLM)           
+AutoModelForCausalLM.register(LlavaFGloraConfig, LlavaLlamaFGloraForCausalLM)       # 通过注册自动生成的模型，我们可以使用AutoModelForCausalLM.from_pretrained("llava_llama")来加载和使用与"llava_llama"配置相关联的模型
