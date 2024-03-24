@@ -25,13 +25,13 @@ from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaMod
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
-from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.modeling_llama import LlamaAttention, LlamaRotaryEmbedding, LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding
 
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32, \
     MultiScaleDeformableAttnFunction_fp16
-from .llava_llama_FGlora import LlavaFGloraConfig
+from ..config import PerceiverConfig, LlavaFGloraConfig
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -85,11 +85,19 @@ def expand_mask(mask: torch.Tensor, dtype: torch.dtype, num_queries: int = 64, v
     bsz, prompt_len = mask.size()
     expanded_mask = mask[:, None, :, None].expand(bsz, 1, prompt_len, value_len).to(dtype)         # [bsz, 1, prompt_len, value_len]
     inverted_mask = 1.0 - expanded_mask
-    queries_mask = torch.zeros(bsz, 1, num_queries, value_len)                                     # [bsz, 1, prompt_len + num_queries, value_len]
+    queries_mask = torch.zeros(bsz, 1, num_queries, value_len).to(inverted_mask.device)                                     # [bsz, 1, prompt_len + num_queries, value_len]
     inverted_mask = torch.cat((inverted_mask, queries_mask), dim = 2)
 
     # 使用masked_fill函数，将掩码中的1替换为指定的填充值，以确保在后续的计算中被忽略
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)       # [bsz, 1, prompt_len + num_queries, value_len]
+
+def image_expand_mask(spatial_shapes: list[Tuple[int, int]], mask: torch.Tensor, dtype: torch.dtype):
+    spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long)
+    expanded_mask = mask[:, :, None, None, None].to(dtype)                                                  # [bsz, num_images, 1, 1, 1]
+    inverted_mask = 1.0 - expanded_mask
+
+        # 使用masked_fill函数，将掩码中的1替换为指定的填充值，以确保在后续的计算中被忽略
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)                  # [bsz, num_images, 1, 1, 1]
 
 def get_reference_points(spatial_shapes, device):
     reference_points_list = []
@@ -107,20 +115,21 @@ def get_reference_points(spatial_shapes, device):
     return reference_points
 
 
-def deform_inputs(sample, spatial_shapes=[(8, 8)]):
-    bs, c, h, w = sample.shape
-    spatial_shapes = torch.as_tensor(
-        spatial_shapes, dtype=torch.long, device=sample.device
-    )
-    level_start_index = torch.cat(
-        (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
-    )
-    reference_points = get_reference_points([(h, w)], sample.device)
-
+def deform_inputs(hidden_states, vision_hidden_states, spatial_shapes=[(12, 12), (24, 24), (48, 48), (96, 96)]):
+    bs, n, hw, c = vision_hidden_states.shape
+    spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=hidden_states.device)
+    shape_sum = (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum()
+    repeat_time = n * hw // shape_sum
+    spatial_shapes = spatial_shapes.repeat(repeat_time, 1)
+    level_start_index = torch.cat((spatial_shapes.new_zeros(
+        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+    reference_points = get_reference_points([(1, 1)], hidden_states.device)
+    reference_points = reference_points.repeat(1, hidden_states.size(1), 1, 1)
     return reference_points, spatial_shapes, level_start_index
 
 class TextQformerCrossAttention(nn.Module):
     def __init__(self, config: LlavaFGloraConfig):
+        super(TextQformerCrossAttention, self).__init__()  
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -135,18 +144,20 @@ class TextQformerCrossAttention(nn.Module):
         
         self.num_queries = config.num_queries
         self.by_pass_hidden_size = config.by_pass_hidden_size
-        self.by_pass_head_dim = self.by_pass_hidden_size // self.num_heads
+        self.by_pass_num_heads = config.by_pass_num_heads
+        self.by_pass_head_dim = self.by_pass_hidden_size // self.by_pass_num_heads
         self.save_mem = config.save_mem
         
         if self.save_mem:
-            self.q_former_weights = nn.Linear(self.hidden_size, self.num_queries * self.num_heads, bias = config.attention_bias)
-            self.q_former_v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.by_pass_head_dim, bias = config.attention_bias)
+            self.q_former_weights = nn.Linear(self.hidden_size, self.num_queries * self.by_pass_num_heads, bias = config.attention_bias)
+            self.q_former_v_proj = nn.Linear(self.hidden_size, self.by_pass_num_heads * self.by_pass_head_dim, bias = config.attention_bias)
+            self.q_former_o_proj = nn.Linear(self.by_pass_num_heads * self.by_pass_head_dim, self.by_pass_hidden_size, bias = config.attention_bias)
         else:
             self.query_tokens = nn.Parameter(torch.zeros(1, self.num_queries, self.num_heads * self.head_dim))
             self.q_former_q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias = config.attention_bias) 
             self.q_former_k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias = config.attention_bias)
             self.q_former_v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias = config.attention_bias)
-            self.q_former_o_proj = nn.Linear(self.num_heads * self.head_dim, self.by_pass_hidden_size, bias = config.attention_bias)
+            self.q_former_o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias = config.attention_bias)
         
         self._init_rope()
     
@@ -196,36 +207,36 @@ class TextQformerCrossAttention(nn.Module):
         
         # q-former部分：
         if self.save_mem:  
-            attn_weights = self.q_former_weights(hidden_states).view(bsz, seq_length, self.num_queries, self.num_heads).transpose(1, 3)                            # (bsz, self.num_heads, num_queries, seq_length)
-            value_states = self.q_former_v_proj(hidden_states).view(bsz, seq_length, self.num_key_value_heads, self.by_pass_head_dim).transpose(1, 2)              # (bsz, self.num_key_value_heads, seq_length, self.by_pass_head_dim)
+            attn_weights = self.q_former_weights(hidden_states).view(bsz, seq_length, self.num_queries, self.by_pass_num_heads).transpose(1, 3)                            # (bsz, self.num_heads, num_queries, seq_length)
+            value_states = self.q_former_v_proj(hidden_states).view(bsz, seq_length, self.by_pass_num_heads, self.by_pass_head_dim).transpose(1, 2)              # (bsz, self.num_key_value_heads, seq_length, self.by_pass_head_dim)
             
             
-            if attn_weights.size() != (bsz, self.num_heads, self.num_queries, seq_length):
+            if attn_weights.size() != (bsz, self.by_pass_num_heads, self.num_queries, seq_length):
                 raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, self.num_queries, seq_length)}, but is"
+                    f"Attention weights should be of size {(bsz, self.by_pass_num_heads, self.num_queries, seq_length)}, but is"
                     f" {attn_weights.size()}"
                 )
 
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, self.num_queries, seq_length):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, self.num_queries, seq_length)}, but is {attention_mask.size()}"
-                    )
-                attn_weights = attn_weights + attention_mask
+            # if attention_mask is not None:
+            #     if attention_mask.size() != (bsz, 1, self.num_queries, seq_length):
+            #         raise ValueError(
+            #             f"Attention mask should be of size {(bsz, 1, self.num_queries, seq_length)}, but is {attention_mask.size()}"
+            #         )
+            #     attn_weights = attn_weights + attention_mask
                 
             attn_weights /= math.sqrt(self.by_pass_head_dim)
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)                                                 
             # (bsz, self.num_heads, num_queries, seq_length) * (bsz, self.num_key_value_heads, seq_length, self.by_pass_head_dim) = (bsz, self.num_key_value_heads, num_queries, self.by_pass_head_dim)
             
-            if attn_output.size() != (bsz, self.num_heads, self.num_queries, self.by_pass_head_dim):
+            if attn_output.size() != (bsz, self.by_pass_num_heads, self.num_queries, self.by_pass_head_dim):
                 raise ValueError(
-                    f"`attn_output` should be of size {(bsz, self.num_heads, self.num_queries, self.by_pass_head_dim)}, but is"
+                    f"`attn_output` should be of size {(bsz, self.by_pass_num_heads, self.num_queries, self.by_pass_head_dim)}, but is"
                     f" {attn_output.size()}"
                 )
                 
             attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.reshape(bsz, seq_length, self.by_pass_hidden_size)
+            attn_output = attn_output.reshape(bsz, self.num_queries, self.by_pass_hidden_size)
 
             attn_output = self.q_former_o_proj(attn_output)
 
@@ -310,6 +321,7 @@ class TextQformerCrossAttention(nn.Module):
         
 class QueryImageCrossAttention(nn.Module):
     def __init__(self, config: LlavaFGloraConfig):
+        super(QueryImageCrossAttention, self).__init__()  
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -320,18 +332,20 @@ class QueryImageCrossAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        
         self.num_queries = config.num_queries
         self.by_pass_hidden_size = config.by_pass_hidden_size
+        self.by_pass_num_heads = config.by_pass_num_heads
+        self.by_pass_head_dim = config.by_pass_hidden_size // config.by_pass_num_heads
         self.num_levels = config.num_levels
         self.num_points = config.num_points
-        self.spatial_shapes = config.spatial_shapes                 # e.g. spatial_shapes=[(12, 12), (24, 24), (48, 48), (96, 96)]
         self.im2col_step = config.im2col_step 
         
         self.proj_to_prompt = nn.Linear(self.hidden_size, self.by_pass_hidden_size)
-        self.sampling_offsets = nn.Linear(self.by_pass_hidden_size, self.num_heads * self.num_levels * self.num_points * 2)
-        self.attention_weights = nn.Linear(self.by_pass_hidden_size, self.num_heads * self.num_levels * self.num_points)
+        self.sampling_offsets = nn.Linear(self.by_pass_hidden_size, self.by_pass_num_heads * self.num_levels * self.num_points * 2)
+        self.attention_weights = nn.Linear(self.by_pass_hidden_size, self.by_pass_num_heads * self.num_levels * self.num_points)
         self.image_v_proj = nn.Linear(config.mm_hidden_size, self.by_pass_hidden_size)
-        self.cross_attn_1_o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias = config.attention_bias)
+        self.cross_attn_1_o_proj = nn.Linear(self.by_pass_num_heads * self.by_pass_head_dim, self.by_pass_hidden_size, bias = config.attention_bias)
         self._init_rope()
         
     def _init_rope(self):
@@ -360,25 +374,16 @@ class QueryImageCrossAttention(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-
-    def image_expand_mask(self, mask: torch.Tensor, dtype: torch.dtype):
-        spatial_shapes = torch.as_tensor(self.spatial_shapes, dtype=torch.long)
-        image_feature_length = (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum()
-        expanded_mask = mask[:, :, None, None, None].repeat(1, 1, 1, 1, image_feature_length).to(dtype)         # [bsz, num_images, 1, 1, image_feature_length]
-        inverted_mask = 1.0 - expanded_mask
-
-        # 使用masked_fill函数，将掩码中的1替换为指定的填充值，以确保在后续的计算中被忽略
-        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)                  # [bsz, num_images, 1, 1, image_feature_length]
     
     
     def forward(
-        self,                                           # n_images这里是每个batch里样本最大数量的图片数量, 有些sample是通过pad得到的
-        hidden_states: torch.Tensor,                    # 包含了coarse_images的一些信息，用于作为prompt，让by_pass_hidden_states去提取相关的fine_grained的信息
+        self,                                                       # n_images这里是每个batch里样本最大数量的图片数量, 有些sample是通过pad得到的
+        hidden_states: torch.Tensor,                                # 包含了coarse_images的一些信息，用于作为prompt，让by_pass_hidden_states去提取相关的fine_grained的信息
         by_pass_hidden_states: torch.Tensor,
-        multi_scale_images_features: torch.Tensor,      # torch.Size(bsz, n_images, \sum_{l=0}^{L-1} H_l \cdot W_l, mm)
-        multi_scale_images_shape: torch.Tensor,         # torch.Size(n_images, n_levels)
-        image_positions: torch.Tensor,                  # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
-        image_attention_mask: Optional[torch.Tensor] = None,  # torch.Size(bsz, n_images, \sum_{l=0}^{L-1} H_l \cdot W_l) 表示图片信息的掩码，哪些图片的tokrn是padding得到的
+        multi_scale_images_features: torch.Tensor,                  # torch.Size(bsz, n_images, \sum_{l=0}^{L-1} H_l \cdot W_l, mm)
+        spatial_shapes: List[Tuple[int, int]],                      # e.g. [(12, 12), (24, 24), (48, 48), (96, 96)]
+        image_positions: torch.Tensor,                              # torch.Size([bsz, n_images, 2])     表示n_images图片的起始和结束位置
+        image_attention_mask: Optional[torch.Tensor] = None,        # torch.Size(bsz, n_images) 表示图片信息的掩码，哪些图片的tokrn是padding得到的
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
@@ -423,10 +428,7 @@ class QueryImageCrossAttention(nn.Module):
         # self.sampling_offsets = nn.Linear(self.by_pass_hidden_size, self.num_heads * self.num_levels * self.num_points * 2)
         _, num_images, _ = image_positions.size()
         bsz, num_queries, by_pass_hidden_size = by_pass_hidden_states.size()
-        assert(len(self.spatial_shapes) == self.num_levels * num_images)
-        spatial_shapes = torch.as_tensor(self.spatial_shapes, dtype=torch.long, device=hidden_states.device)
-        assert(multi_scale_images_features.shape[2] == (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum())
-        image_attention_mask_5d = self.image_expand_mask(image_attention_mask, by_pass_hidden_states.dtype)                 # [bsz, num_images, 1, 1, image_feature_length]    
+        image_attention_mask_5d = image_expand_mask(spatial_shapes, image_attention_mask, by_pass_hidden_states.dtype).to(by_pass_hidden_states.device)                 # [bsz, num_images, 1, 1, 1]    
 
         if by_pass_hidden_states.size() != (bsz, self.num_queries, self.by_pass_hidden_size):
             raise ValueError(
@@ -434,20 +436,20 @@ class QueryImageCrossAttention(nn.Module):
                 f" {by_pass_hidden_states.size()}"
             )
         attn_weights = []
-        attn_output = [torch.zeros(bsz, num_images * self.num_queries, self.by_pass_hidden_size)]
+        attn_output = torch.zeros((bsz, num_images * self.num_queries, self.by_pass_hidden_size), device=hidden_states.device)
         image_hidden_states_per_batch = []
         
         for image_index in range(num_images):
-            image_hidden_states_per_batch = [hidden_states[b, image_positions[b, image_index, 0]: image_positions[b, image_index, 1]] for b in range(bsz)]
+            image_hidden_states_per_batch = [hidden_states[b, int(image_positions[b, image_index, 0]): int(image_positions[b, image_index, 1])] for b in range(bsz)]
             image_hidden_states = torch.nn.utils.rnn.pad_sequence(image_hidden_states_per_batch, batch_first=True, padding_value=-100)    
             prompt_attention_mask = image_hidden_states.ne(-100)[..., 0]                                                          # (bsz, image_prompt_length)
             image_prompt_length = image_hidden_states.shape[1]
-            prompt_attention_mask_4d = expand_mask(prompt_attention_mask, image_hidden_states.dtype, self.num_queries, self.num_levels * self.num_points)           # (bsz, 1, num_queriues + prompt_len, value_len)
-            image_attention_mask_4d = image_attention_mask_5d[:, image_index]                                                                                       # [bsz, 1, 1, image_feature_length]    
+            prompt_attention_mask_4d = expand_mask(prompt_attention_mask, image_hidden_states.dtype, self.num_queries, self.num_levels * self.num_points).to(image_hidden_states.device)           # (bsz, 1, num_queriues + prompt_len, value_len)
+            image_attention_mask_4d = image_attention_mask_5d[:, image_index]                                                                                       # [bsz, 1, 1, 1]    
               
             image_prompt = self.proj_to_prompt(image_hidden_states)                                                             # (bsz, image_prompt_length(coarse-grained-image-token-length), by_pass_hidden_size) 
             prompt_together_queries = torch.cat((image_prompt, by_pass_hidden_states), dim = 1)                                 # (bsz, image_prompt_length + self.num_queries, by_pass_hidden_size)
-            reference_points, spatial_shapes, level_start_index = deform_inputs(by_pass_hidden_states, multi_scale_images_features, self.spatial_shapes)
+            reference_points, spatial_shapes, level_start_index = deform_inputs(by_pass_hidden_states, multi_scale_images_features, spatial_shapes)
             # reference_points.shape = torch.Size([1, image_prompt_length + num_queries, 1, 2])
             # spatial_points.shape = torch.Size([n_images * n_levels, 2])          default: n_levels=4
             # level_start_index = torch.Size([n_images * n_levels])
@@ -455,18 +457,22 @@ class QueryImageCrossAttention(nn.Module):
             
             # 计算sampling_offsets:
             sampling_offsets = self.sampling_offsets(prompt_together_queries)                                                   # 等号右边： (bsz, num_queries + image_prompt_length, self.num_heads * self.num_levels * self.num_points * 2)
-            sampling_offsets = sampling_offsets.view(bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2)     # sampling_offsets.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2])
+            sampling_offsets = sampling_offsets.view(bsz, num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points, 2)     # sampling_offsets.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2])
             
             # 计算attention_weights:
             # self.attention_weights = nn.Linear(self.by_pass_hidden_size, self.num_heads * self.num_levels * self.num_points)
-            attention_weights = self.attention_weights(prompt_together_queries).view(bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels * self.num_points)
+            attention_weights = self.attention_weights(prompt_together_queries).view(bsz, num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels * self.num_points)
+
+            # print("attention_weights.shape", attention_weights.shape)                   # attention_weights.shape torch.Size([1, 640, 6, 256])
+            # print("prompt_attention_mask_4d.shape", prompt_attention_mask_4d.shape)     # prompt_attention_mask_4d.shape torch.Size([1, 1, 640, 256])
+            # print("image_attention_mask_4d.shape", image_attention_mask_4d.shape)       # image_attention_mask_4d.shape torch.Size([1, 1, 1, 1])
             attention_weights = attention_weights + prompt_attention_mask_4d.transpose(1, 2) + image_attention_mask_4d.transpose(1, 2)
             attention_weights = attention_weights.softmax(-1)
-            attention_weights = attention_weights.view(bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points)       
+            attention_weights = attention_weights.view(bsz, num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points)       
             # attention_weights的size是 (bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points)  
-            if attention_weights.size() != (bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points):
+            if attention_weights.size() != (bsz, num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points):
                 raise ValueError(
-                    f"`attention_weights` should be of size {(bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points)}, but is"
+                    f"`attention_weights` should be of size {(bsz, num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points)}, but is"
                     f" {attention_weights.size()}"
                 )
             attn_weights.append(attention_weights)
@@ -476,29 +482,29 @@ class QueryImageCrossAttention(nn.Module):
             # self.image_v_proj = nn.Linear(config.mm_hidden_size, self.by_pass_hidden_size)                                    
             value_states = self.image_v_proj(multi_scale_images_features[:, image_index])                                                 # (bsz, \sum_{l=0}^{L-1} H_l \cdot W_l, mm) 作为value
             _, num_values, _ = value_states.size()
-            assert num_values == torch.sum(multi_scale_images_shape[0, image_index], dim = -1)
-            value_states = value_states.view(bsz, num_values, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, num_values, self.by_pass_num_heads, self.by_pass_head_dim).contiguous()
             
             # 计算spatial_shapes, level_start_index等等
-            level_start_index_per_image = level_start_index[image_index * self.num_levels, (image_index + 1) * self.num_levels] 
+            level_start_index_per_image = level_start_index[image_index * self.num_levels: (image_index + 1) * self.num_levels] 
             if level_start_index_per_image.size() != (self.num_levels, ):
                 raise ValueError(
                     f"`level_start_index_per_image` should be of size {(self.num_levels, )}, but is"
                     f" {level_start_index_per_image.size()}"
                 )
-            spatial_shapes_per_image = spatial_shapes[image_index * self.num_levels, (image_index + 1) * self.num_levels]
+            spatial_shapes_per_image = spatial_shapes[image_index * self.num_levels: (image_index + 1) * self.num_levels]
             if spatial_shapes_per_image.size() != (self.num_levels, 2):
                 raise ValueError(
                     f"`level_start_index_per_image` should be of size {(self.num_levels, 2)}, but is"
                     f" {spatial_shapes_per_image.size()}"
                 )
                 
-            # sampling_offsets.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2])
-            # reference_points.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_levels, 2])
-            sampling_locations = sampling_offsets + reference_points[:, :, None, :, None, :]                                                         
-            if sampling_locations.size() != (bsz, self.num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2):
+            # sampling_offsets.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2])        torch.Size([1, 640, 6, 4, 64, 2])
+            # reference_points.shape = torch.Size([bsz, num_queries + image_prompt_length, self.num_levels, 2])                                         torch.Size([1, 64, 4, 2])
+
+            sampling_locations = sampling_offsets + reference_points[:, :1, None, :, None, :]                                                         
+            if sampling_locations.size() != (bsz, self.num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points, 2):
                 raise ValueError(
-                    f"`level_start_index_per_image` should be of size {(bsz, self.num_queries + image_prompt_length, self.num_heads, self.num_levels, self.num_points, 2)}, but is"
+                    f"`level_start_index_per_image` should be of size {(bsz, self.num_queries + image_prompt_length, self.by_pass_num_heads, self.num_levels, self.num_points, 2)}, but is"
                     f" {sampling_locations.size()}"
                 )
                 
@@ -506,16 +512,31 @@ class QueryImageCrossAttention(nn.Module):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp16
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
-            output = MultiScaleDeformableAttnFunction.apply(                                                
-                value_states, spatial_shapes_per_image, level_start_index_per_image, sampling_locations,
-                attention_weights, self.im2col_step)
+                
+            if value_states.dtype == torch.bfloat16:
+                # print('*'*100)
+                # print(value_states.shape, value_states.device, value_states.dtype)
+                # print(spatial_shapes_per_image.shape, spatial_shapes_per_image.device, spatial_shapes_per_image.dtype)
+                # print(level_start_index_per_image.shape, level_start_index_per_image.device, level_start_index_per_image.dtype)
+                # print(sampling_locations.shape, sampling_locations.device, sampling_locations.dtype)
+                # print(attention_weights.shape, attention_weights.device, attention_weights.dtype)
+                # print('*'*100)
+                output = MultiScaleDeformableAttnFunction.apply(value_states.to(torch.float32), spatial_shapes_per_image, level_start_index_per_image,
+                                            sampling_locations, attention_weights, self.im2col_step)
+                
+                output = output.to(hidden_states.dtype)
+            else:
+                output = MultiScaleDeformableAttnFunction.apply(value_states, spatial_shapes_per_image, level_start_index_per_image,
+                                            sampling_locations, attention_weights, self.im2col_step)
+
             if output.size() != (bsz, self.num_queries + image_prompt_length, by_pass_hidden_size):
                 raise ValueError(
                     f"`output` should be of size {(bsz, self.num_queries + image_prompt_length, by_pass_hidden_size)}, but is"
                     f" {output.size()}"
                 )
-            attn_output[:, image_index * self.num_queries : (image_index + 1) * self.num_queries] = output[:, -self.num_queries]
+            attn_output[:, image_index * self.num_queries : (image_index + 1) * self.num_queries] = output[:, -self.num_queries:]
         
+        attn_output = attn_output.to(self.cross_attn_1_o_proj.weight.dtype)
         attn_output = self.cross_attn_1_o_proj(attn_output)
         if not output_attentions:
             attn_weights = None
@@ -525,10 +546,11 @@ class QueryImageCrossAttention(nn.Module):
 
 class QuerySelfAttention(nn.Module):
     def __init__(self, config: LlavaFGloraConfig):
+        super(QuerySelfAttention, self).__init__() 
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.by_pass_hidden_size
-        self.num_heads = config.num_attention_heads
+        self.num_heads = config.by_pass_num_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -640,6 +662,7 @@ class QuerySelfAttention(nn.Module):
     
 class TextQueryCrossAttention(nn.Module):
     def __init__(self, config: LlavaFGloraConfig):
+        super(TextQueryCrossAttention, self).__init__()
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -652,12 +675,14 @@ class TextQueryCrossAttention(nn.Module):
         self.is_causal = True
         
         self.num_queries = config.num_queries
-        self.by_pass_hidden_size = config.hidden_size
+        self.by_pass_hidden_size = config.by_pass_hidden_size
+        self.by_pass_num_heads = config.by_pass_num_heads
+        self.by_pass_head_dim = self.by_pass_hidden_size // self.by_pass_num_heads
         
-        self.cross_attn_2_q_proj = nn.Linear(self.by_pass_hidden_size, self.num_heads * self.head_dim, bias = config.attention_bias)
-        self.cross_attn_2_k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias = config.attention_bias)
-        self.cross_attn_2_v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias = config.attention_bias)
-        self.cross_attn_2_o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias = config.attention_bias)
+        self.cross_attn_2_q_proj = nn.Linear(self.hidden_size, self.by_pass_num_heads * self.by_pass_head_dim, bias = config.attention_bias)
+        self.cross_attn_2_k_proj = nn.Linear(self.by_pass_hidden_size, self.by_pass_num_heads * self.by_pass_head_dim, bias = config.attention_bias)
+        self.cross_attn_2_v_proj = nn.Linear(self.by_pass_hidden_size, self.by_pass_num_heads * self.by_pass_head_dim, bias = config.attention_bias)
+        self.cross_attn_2_o_proj = nn.Linear(self.by_pass_num_heads * self.by_pass_head_dim, self.hidden_size, bias = config.attention_bias)
         
         self._init_rope()
         
@@ -703,36 +728,37 @@ class TextQueryCrossAttention(nn.Module):
         bsz, num_queries, _ = by_pass_hidden_states.size()
         assert num_queries % self.num_queries == 0, f"num_queries ({num_queries}) must be divisible by config.num_queries ({self.num_queries})"
 
-        query_states = self.cross_attn_2_q_proj(hidden_states).view(bsz, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.cross_attn_2_k_proj(by_pass_hidden_states).view(bsz, num_queries, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.cross_attn_2_v_proj(by_pass_hidden_states).view(bsz, num_queries, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = self.cross_attn_2_q_proj(hidden_states).view(bsz, seq_length, self.by_pass_num_heads, self.by_pass_head_dim).transpose(1, 2)                 # (bsz, self.by_pass_num_heads, seq_length, self.by_pass_head_dim)
+        key_states = self.cross_attn_2_k_proj(by_pass_hidden_states).view(bsz, num_queries, self.by_pass_num_heads, self.by_pass_head_dim).transpose(1, 2)          # (bsz, self.by_pass_num_heads, num_queries, self.by_pass_head_dim)
+        value_states = self.cross_attn_2_v_proj(by_pass_hidden_states).view(bsz, num_queries, self.by_pass_num_heads, self.by_pass_head_dim).transpose(1, 2)        # (bsz, self.by_pass_num_heads, num_queries, self.by_pass_head_dim)
         
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)         # (bsz, self.num_heads, seq_length, self.head_dim) * (bsz, self.num_key_value_heads, self.head_dim, num_queries) = (bsz, self.num_heads, seq_length, num_queries)
+        # (bsz, self.by_pass_num_heads, seq_length, self.by_pass_head_dim) * (bsz, self.by_pass_num_heads, self.by_pass_head_dim, num_queries) = (bsz, self.by_pass_num_heads, seq_length, num_queries)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.by_pass_head_dim)         
         
-        if attn_weights.size() != (bsz, self.num_heads, seq_length, num_queries):
+        if attn_weights.size() != (bsz, self.by_pass_num_heads, seq_length, num_queries):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, seq_length, num_queries)}, but is"
+                f"Attention weights should be of size {(bsz, self.by_pass_num_heads, seq_length, num_queries)}, but is"
                 f" {attn_weights.size()}"
             )
 
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, seq_length, num_queries):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, seq_length, num_queries)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+        # if attention_mask is not None:
+        #     if attention_mask.size() != (bsz, 1, seq_length, num_queries):
+        #         raise ValueError(
+        #             f"Attention mask should be of size {(bsz, 1, seq_length, num_queries)}, but is {attention_mask.size()}"
+        #         )
+        #     attn_weights = attn_weights + attention_mask
         
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)          
-        attn_output = torch.matmul(attn_weights, value_states)         # (bsz, self.num_heads, seq_length, num_queries) * (bsz, self.num_key_value_heads, num_queries, self.head_dim) = (bsz, self.num_heads, seq_length, self.head_dim)                                         
+        attn_output = torch.matmul(attn_weights, value_states)         # (bsz, self.by_pass_num_heads, seq_length, num_queries) * (bsz, self.by_pass_num_heads, num_queries, self.by_pass_head_dim) = (bsz, self.by_pass_num_heads, seq_length, self.by_pass_head_dim)                                         
         
-        if attn_output.size() != (bsz, self.num_heads, seq_length, self.head_dim):
+        if attn_output.size() != (bsz, self.by_pass_num_heads, seq_length, self.by_pass_head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, seq_length, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, self.by_pass_num_heads, seq_length, self.by_pass_head_dim)}, but is"
                 f" {attn_output.size()}"
             )
             
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, seq_length, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, seq_length, self.by_pass_hidden_size)
         attn_output = self.cross_attn_2_o_proj(attn_output)
         
         return attn_output, attn_weights, past_key_value
